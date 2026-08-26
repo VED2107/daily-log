@@ -1,0 +1,92 @@
+name: Heartbeat
+
+# One commit an hour, in one repository.
+#
+# This used to live in four repositories at once — the profile README, STC,
+# lunora-studio and portfolio — which meant a project's history was interleaved
+# with commits that changed nothing in that project. Keeping it here leaves
+# those histories to their own work.
+#
+# GitHub's scheduler is best-effort: an hourly cron under load can be delayed or
+# skipped, so treat the count as approximate rather than exact.
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # top of every hour, UTC
+  workflow_dispatch:      # and on demand from the Actions tab
+
+# Only what is needed to push one file back.
+permissions:
+  contents: write
+
+# A delayed run must never overlap the next one and race on the same file.
+concurrency:
+  group: heartbeat
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update the log
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib
+          from datetime import datetime, timezone
+
+          path = pathlib.Path('activity-log.json')
+          now = datetime.now(timezone.utc)
+
+          try:
+              data = json.loads(path.read_text())
+          except Exception:
+              data = {}
+
+          count = int(data.get('total_beats', 0)) + 1
+          data = {
+              'total_beats': count,
+              'last_run_utc': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'last_run_readable': now.strftime('%B %d, %Y %H:%M UTC'),
+              'day_of_year': int(now.strftime('%j')),
+              'week_number': int(now.strftime('%U')),
+              'author': 'VED2107',
+          }
+          path.write_text(json.dumps(data, indent=2) + '\n')
+          print(f'beat #{count} at {data["last_run_utc"]}')
+
+          # Hand the number to the next step without re-reading the file.
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f'BEAT_COUNT={count}\n')
+          PY
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name  "VED2107"
+          git config user.email "vedchauhan2107@gmail.com"
+          git add activity-log.json
+
+          if git diff --staged --quiet; then
+            echo "nothing changed — skipping"
+            exit 0
+          fi
+
+          git commit -m "chore: heartbeat #${BEAT_COUNT} ($(date -u +%Y-%m-%dT%H:%MZ))"
+
+          # A scheduled run can collide with a manual one; rebase rather than fail.
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "pushed on attempt ${attempt}"
+              exit 0
+            fi
+            echo "push rejected — rebasing and retrying"
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          done
+          echo "could not push after 3 attempts"
+          exit 1
